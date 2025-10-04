@@ -1,0 +1,23 @@
+version: '3.8'
+
+# กำหนด Network เพื่อให้ทุก Service คุยกันได้ด้วยชื่อ Service
+networks:
+  operaton-net:
+    driver: bridge
+
+services:
+  fastapi-worker:
+    build: 
+      context: .
+      dockerfile: Dockerfile_worker
+    container_name: fastapi-worker
+    environment:
+      # *** สำคัญมาก: เปลี่ยน [IP_OPERATON_MACHINE] เป็น IP หรือ HOSTNAME ของเครื่องที่รัน Operaton จริง ***
+      CAMUNDA_REST_URL: "http://docker2.devops.esc.yipintsoigroup.com:8080/engine-rest"
+      # FASTAPI_BASE_URL ใช้ชื่อ Service ภายใน Docker Network (เพราะ Worker และ API รันบนเครื่องเดียวกัน)
+      FASTAPI_BASE_URL: "http://docker1.devops.esc.yipintsoigroup.com:8300/api/v1"
+    networks:
+      - operaton-net
+    volumes:
+      - ./worker_service.py:/app/worker_service.py
+    restart: always
