@@ -3,7 +3,7 @@ services:
   fastapi-worker:
     build: 
       context: .
-      dockerfile: Dockerfile_worker
+      dockerfile: Dockerfile
     container_name: fastapi-worker
     environment:
       # *** สำคัญมาก: เปลี่ยน [IP_OPERATON_MACHINE] เป็น IP หรือ HOSTNAME ของเครื่องที่รัน Operaton จริง ***
