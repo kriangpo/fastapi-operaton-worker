@@ -5,12 +5,11 @@ import logging
 import os
 
 # ดึง URL จาก Environment Variable
-# ผู้ใช้ต้องกำหนด CAMUNDA_REST_URL ใน docker-compose.yaml เพื่อชี้ไปที่ IP/Hostname ของเครื่อง Operaton
-CAMUNDA_URL = os.environ.get("CAMUNDA_REST_URL", "http://docker2.devops.esc.yipintsoigroup.com:8080/engine-rest")
+# CAMUNDA_REST_URL ควรชี้ไปที่ IP/Hostname ของเครื่อง Operaton (Machine A)
+CAMUNDA_URL = os.environ.get("CAMUNDA_REST_URL", "http://operaton:8080/engine-rest")
 
-# FASTAPI_URL ถูกแก้ไขให้ใช้ชื่อ Service 'fastapi-api' ใน Docker Compose
-# (สมมติว่า worker และ api ยังคงรันบนเครื่องเดียวกัน)
-FASTAPI_URL = os.environ.get("FASTAPI_BASE_URL", "http://docker1.devops.esc.yipintsoigroup.com:8300/api/v1") 
+# FASTAPI_BASE_URL ใช้ชื่อ Service ภายใน Docker Network (เพราะ Worker และ API รันบนเครื่องเดียวกัน)
+FASTAPI_URL = os.environ.get("FASTAPI_BASE_URL", "http://fastapi-api:8000/api/v1") 
 
 # กำหนด Worker ID ที่ไม่ซ้ำกัน
 WORKER_ID = "fastapi_integration_worker"
@@ -18,18 +17,32 @@ TOPICS = ["save-db-topic", "send-email-topic"]
 
 logging.basicConfig(level=logging.INFO)
 
+# --- ฟังก์ชันช่วยเหลือเพื่อดึงค่าตัวแปรอย่างปลอดภัย ---
+def get_variable_value(variables, name):
+    """
+    ดึงค่า 'value' จากตัวแปร Camunda อย่างปลอดภัย
+    คืนค่าเป็นสตริงเปล่าถ้าตัวแปรไม่มีอยู่หรือมีค่าเป็น None
+    """
+    var_obj = variables.get(name)
+    if var_obj and 'value' in var_obj:
+        # Camunda ส่งค่าตัวเลขหรือ boolean มาเป็นสตริง ดังนั้นจึงแปลงเป็นสตริงเสมอ
+        return str(var_obj['value'])
+    return ""
+
 # --- ฟังก์ชันการเรียก FastAPI ---
 
 def call_fastapi_save_db(variables):
     """เรียก /api/v1/save-db ด้วยตัวแปรจาก BPMN"""
+    # ใช้ get_variable_value เพื่อดึงค่าอย่างปลอดภัย
     payload = {
-        "employeeName": variables.get("employeeName").get("value"),
-        "leaveDate": variables.get("leaveDate").get("value"),
-        "reason": variables.get("reason").get("value"),
-        "approved": variables.get("approved").get("value"),
+        "employeeName": get_variable_value(variables, "employeeName"),
+        "leaveDate": get_variable_value(variables, "leaveDate"),
+        "reason": get_variable_value(variables, "reason"),
+        "approved": get_variable_value(variables, "approved"),
     }
     logging.info(f"Calling FastAPI Save DB with payload: {payload}")
     
+    # ตรวจสอบการเชื่อมต่อกับ FastAPI API
     response = requests.post(f"{FASTAPI_URL}/save-db", json=payload)
     response.raise_for_status() 
     
@@ -37,12 +50,14 @@ def call_fastapi_save_db(variables):
 
 def call_fastapi_send_email(variables):
     """เรียก /api/v1/send-email ด้วยตัวแปรจาก BPMN"""
+    # ใช้ get_variable_value เพื่อดึงค่าอย่างปลอดภัย
     payload = {
-        "employeeName": variables.get("employeeName").get("value"),
-        "approved": variables.get("approved").get("value"),
+        "employeeName": get_variable_value(variables, "employeeName"),
+        "approved": get_variable_value(variables, "approved"),
     }
     logging.info(f"Calling FastAPI Send Email with payload: {payload}")
     
+    # ตรวจสอบการเชื่อมต่อกับ FastAPI API
     response = requests.post(f"{FASTAPI_URL}/send-email", json=payload)
     response.raise_for_status() 
 
@@ -72,7 +87,7 @@ def fetch_and_lock():
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        # พิมพ์ URL เพื่อช่วย Debug
+        # รายงานข้อผิดพลาดในการเชื่อมต่อ Engine
         logging.error(f"Error fetching tasks from {CAMUNDA_URL}: {e}") 
         return []
 
@@ -104,10 +119,13 @@ def handle_tasks(tasks):
             elif topic == "send-email-topic":
                 call_fastapi_send_email(variables)
             
+            # เมื่อทำงานสำเร็จ Worker จะส่งสัญญาณ Complete กลับไปที่ Engine 
             complete_task(task_id)
 
         except Exception as e:
-            logging.error(f"Failed to process task {task_id}: {e}")
+            # หากเกิดข้อผิดพลาดในการเรียก API (เช่น 500 Internal Error) Task จะไม่ Complete
+            # และจะถูกปล่อยให้ Worker อื่นดึงไปทำใหม่เมื่อ Lock หมดอายุ
+            logging.error(f"Failed to process task {task_id} (Topic: {topic}): {e}")
 
 def run_worker():
     logging.info(f"Starting External Task Worker. Target Engine: {CAMUNDA_URL}. Target API: {FASTAPI_URL}. Polling...")
@@ -122,4 +140,4 @@ def run_worker():
         time.sleep(5)
 
 if __name__ == "__main__":
-    run_worker() 
+    run_worker()
