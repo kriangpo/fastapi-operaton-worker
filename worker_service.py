@@ -1,143 +1,154 @@
 import requests
-import time
-import json
-import logging
 import os
+import json
+import time
+import logging
 
-# ดึง URL จาก Environment Variable
-# CAMUNDA_REST_URL ควรชี้ไปที่ IP/Hostname ของเครื่อง Operaton (Machine A)
-CAMUNDA_URL = os.environ.get("CAMUNDA_REST_URL", "http://operaton:8080/engine-rest")
+# ตั้งค่า Logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger(__name__)
 
-# FASTAPI_BASE_URL ใช้ชื่อ Service ภายใน Docker Network (เพราะ Worker และ API รันบนเครื่องเดียวกัน)
-FASTAPI_URL = os.environ.get("FASTAPI_BASE_URL", "http://fastapi-api:8000/api/v1") 
+# ดึง URL จาก Environment Variables
+CAMUNDA_REST_URL = os.environ.get("CAMUNDA_REST_URL", "http://operaton:8080/engine-rest")
+FASTAPI_URL = os.environ.get("FASTAPI_URL", "http://fastapi-api:8000/api/v1")
 
-# กำหนด Worker ID ที่ไม่ซ้ำกัน
-WORKER_ID = "fastapi_integration_worker"
-TOPICS = ["save-db-topic", "send-email-topic"]
+# กำหนด Topic เดียวสำหรับ External HTTP Calls ทั้งหมด
+GENERIC_HTTP_TOPIC = "http-request-topic"
+TOPICS = [GENERIC_HTTP_TOPIC]
 
-logging.basicConfig(level=logging.INFO)
+WORKER_ID = "generic-http-worker"
+MAX_TASKS = 5
+LOCK_DURATION_MS = 30000 # 30 วินาที
+POLL_INTERVAL_SEC = 5 # 5 วินาที
 
-# --- ฟังก์ชันช่วยเหลือเพื่อดึงค่าตัวแปรอย่างปลอดภัย ---
-def get_variable_value(variables, name):
-    """
-    ดึงค่า 'value' จากตัวแปร Camunda อย่างปลอดภัย
-    คืนค่าเป็นสตริงเปล่าถ้าตัวแปรไม่มีอยู่หรือมีค่าเป็น None
-    """
-    var_obj = variables.get(name)
-    if var_obj and 'value' in var_obj:
-        # Camunda ส่งค่าตัวเลขหรือ boolean มาเป็นสตริง ดังนั้นจึงแปลงเป็นสตริงเสมอ
-        return str(var_obj['value'])
-    return ""
+# --- Helper Functions ---
 
-# --- ฟังก์ชันการเรียก FastAPI ---
-
-def call_fastapi_save_db(variables):
-    """เรียก /api/v1/save-db ด้วยตัวแปรจาก BPMN"""
-    # ใช้ get_variable_value เพื่อดึงค่าอย่างปลอดภัย
-    payload = {
-        "employeeName": get_variable_value(variables, "employeeName"),
-        "leaveDate": get_variable_value(variables, "leaveDate"),
-        "reason": get_variable_value(variables, "reason"),
-        "approved": get_variable_value(variables, "approved"),
-    }
-    logging.info(f"Calling FastAPI Save DB with payload: {payload}")
-    
-    # ตรวจสอบการเชื่อมต่อกับ FastAPI API
-    response = requests.post(f"{FASTAPI_URL}/save-db", json=payload)
-    response.raise_for_status() 
-    
-    return {"status": "db saved successfully"}
-
-def call_fastapi_send_email(variables):
-    """เรียก /api/v1/send-email ด้วยตัวแปรจาก BPMN"""
-    # ใช้ get_variable_value เพื่อดึงค่าอย่างปลอดภัย
-    payload = {
-        "employeeName": get_variable_value(variables, "employeeName"),
-        "approved": get_variable_value(variables, "approved"),
-    }
-    logging.info(f"Calling FastAPI Send Email with payload: {payload}")
-    
-    # ตรวจสอบการเชื่อมต่อกับ FastAPI API
-    response = requests.post(f"{FASTAPI_URL}/send-email", json=payload)
-    response.raise_for_status() 
-
-    return {"status": "email sent successfully"}
-
-# --- Worker Logic หลัก ---
-
-def fetch_and_lock():
-    """ดึงงานจาก Engine และ Lock งานนั้น"""
-    body = {
-        "workerId": WORKER_ID,
-        "maxTasks": 5,
-        "usePriority": True,
-        "asyncResponseTimeout": 30000,
-        "topics": [
-            {"topicName": "save-db-topic", "lockDuration": 60000},
-            {"topicName": "send-email-topic", "lockDuration": 60000},
-        ]
-    }
-    
+def get_variable_value(variables, name, default=""):
+    """ฟังก์ชันดึงค่าตัวแปรอย่างปลอดภัย"""
     try:
-        response = requests.post(
-            f"{CAMUNDA_URL}/external-task/fetchAndLock",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(body)
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        # รายงานข้อผิดพลาดในการเชื่อมต่อ Engine
-        logging.error(f"Error fetching tasks from {CAMUNDA_URL}: {e}") 
-        return []
+        # Camunda API ส่งตัวแปรมาในรูปแบบ {"variableName": {"value": "...", "type": "..."}}
+        return variables.get(name, {}).get("value", default)
+    except Exception as e:
+        logger.error(f"Error extracting variable '{name}': {e}")
+        return default
 
 def complete_task(task_id):
-    """ส่งสัญญาณให้ Engine ทราบว่างานเสร็จสิ้นแล้ว"""
-    body = {"workerId": WORKER_ID}
+    """ส่งสัญญาณ Complete กลับไปยัง Operaton Engine"""
+    url = f"{CAMUNDA_REST_URL}/external-task/{task_id}/complete"
+    payload = {"workerId": WORKER_ID, "variables": {}}
     try:
-        requests.post(
-            f"{CAMUNDA_URL}/external-task/{task_id}/complete",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(body)
-        ).raise_for_status()
-        logging.info(f"Task {task_id} completed successfully.")
+        requests.post(url, json=payload).raise_for_status()
+        logger.info(f"Task {task_id} completed successfully.")
+        return True
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error completing task {task_id}: {e}")
+        logger.error(f"Failed to complete task {task_id}. Error: {e}")
+        return False
 
-def handle_tasks(tasks):
-    """จัดการ Task ที่ถูกดึงมา"""
+def handle_failure(task_id, error_message):
+    """จัดการเมื่อ Worker ประมวลผลล้มเหลว"""
+    url = f"{CAMUNDA_REST_URL}/external-task/{task_id}/failure"
+    payload = {
+        "workerId": WORKER_ID,
+        "errorMessage": "Generic HTTP Worker failed to execute request.",
+        "errorDetails": error_message,
+        "retries": 0, 
+        "retryTimeout": 60000 
+    }
+    try:
+        requests.post(url, json=payload).raise_for_status()
+        logger.warning(f"Task {task_id} reported failure to Engine.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to report failure for task {task_id}. Error: {e}")
+
+# --- Generic Task Handler ---
+
+def handle_generic_http_request(task_id, variables):
+    """
+    จัดการ External Task โดยการสร้างและส่ง HTTP Request ไปยัง URL ที่กำหนด 
+    โดยใช้ตัวแปร BPMN: requestUrl, httpMethod, requestPayload
+    """
+    
+    # ดึงตัวแปรที่จำเป็นในการสร้าง Request
+    http_method = get_variable_value(variables, "httpMethod", "POST").upper()
+    request_url = get_variable_value(variables, "requestUrl")
+    payload_str = get_variable_value(variables, "requestPayload", "{}")
+
+    if not request_url:
+        error_msg = "BPMN variable 'requestUrl' is missing or empty."
+        logger.error(error_msg)
+        handle_failure(task_id, error_msg)
+        return False
+
+    try:
+        # 1. Parse Payload (Body)
+        payload = json.loads(payload_str)
+        
+        # 2. ส่ง HTTP Request
+        logger.info(f"Executing {http_method} to {request_url} with payload: {payload}")
+        
+        response = requests.request(
+            method=http_method,
+            url=request_url,
+            json=payload,
+            timeout=10 # กำหนด Timeout 10 วินาที
+        )
+        response.raise_for_status() # ตรวจสอบ HTTP Status (4xx, 5xx)
+
+        logger.info(f"Request to {request_url} successful. Status: {response.status_code}")
+        return True
+        
+    except json.JSONDecodeError as e:
+        error_msg = f"Failed to parse 'requestPayload' JSON. Error: {e}"
+        handle_failure(task_id, error_msg)
+    except requests.exceptions.RequestException as e:
+        error_msg = f"HTTP Request Failed ({http_method} {request_url}). Error: {e}"
+        handle_failure(task_id, error_msg)
+    except Exception as e:
+        error_msg = f"An unexpected error occurred: {e}"
+        handle_failure(task_id, error_msg)
+        
+    return False
+
+def process_tasks(tasks):
+    """กระจายงานไปยัง Task Handler ที่เหมาะสม"""
     for task in tasks:
-        task_id = task['id']
-        topic = task['topicName']
-        variables = task['variables']
+        task_id = task.get("id")
+        topic = task.get("topicName")
+        variables = task.get("variables", {})
         
-        logging.info(f"Processing Task ID: {task_id} with Topic: {topic}")
-        
-        try:
-            if topic == "save-db-topic":
-                call_fastapi_save_db(variables)
-            elif topic == "send-email-topic":
-                call_fastapi_send_email(variables)
-            
-            # เมื่อทำงานสำเร็จ Worker จะส่งสัญญาณ Complete กลับไปที่ Engine 
-            complete_task(task_id)
+        logger.info(f"Processing Task ID: {task_id} with Topic: {topic}")
 
-        except Exception as e:
-            # หากเกิดข้อผิดพลาดในการเรียก API (เช่น 500 Internal Error) Task จะไม่ Complete
-            # และจะถูกปล่อยให้ Worker อื่นดึงไปทำใหม่เมื่อ Lock หมดอายุ
-            logging.error(f"Failed to process task {task_id} (Topic: {topic}): {e}")
-
-def run_worker():
-    logging.info(f"Starting External Task Worker. Target Engine: {CAMUNDA_URL}. Target API: {FASTAPI_URL}. Polling...")
-    while True:
-        tasks = fetch_and_lock()
-        if tasks:
-            logging.info(f"Fetched {len(tasks)} tasks.")
-            handle_tasks(tasks)
+        if topic == GENERIC_HTTP_TOPIC:
+            handle_generic_http_request(task_id, variables)
         else:
-            logging.info("No tasks to fetch. Waiting...")
+            logger.warning(f"Unknown topic: {topic}. Skipping.")
+
+def fetch_and_lock():
+    """ดึงและล็อคงามจาก Operaton Engine"""
+    url = f"{CAMUNDA_REST_URL}/external-task/fetchAndLock"
+    payload = {
+        "workerId": WORKER_ID,
+        "maxTasks": MAX_TASKS,
+        "usePriority": True,
+        "topics": [{"topicName": t, "lockDuration": LOCK_DURATION_MS} for t in TOPICS]
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        tasks = response.json()
         
-        time.sleep(5)
+        if tasks:
+            logger.info(f"Fetched {len(tasks)} tasks.")
+            process_tasks(tasks)
+        else:
+            logger.info("No tasks to fetch. Waiting...")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching tasks from Camunda Engine: {e}")
 
 if __name__ == "__main__":
-    run_worker()
+    logger.info(f"Starting Generic HTTP Worker. Target Engine: {CAMUNDA_REST_URL}. Target API (Internal Base): {FASTAPI_URL}. Polling...")
+    while True:
+        fetch_and_lock()
+        time.sleep(POLL_INTERVAL_SEC)
