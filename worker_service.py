@@ -118,10 +118,16 @@ def process_tasks(tasks):
         
         logger.info(f"Processing Task ID: {task_id} with Topic: {topic}")
 
+        success = False
         if topic == GENERIC_HTTP_TOPIC:
-            handle_generic_http_request(task_id, variables)
+            # เรียก handler และเก็บผลลัพธ์ความสำเร็จ
+            success = handle_generic_http_request(task_id, variables)
         else:
             logger.warning(f"Unknown topic: {topic}. Skipping.")
+            
+        # ตรวจสอบผลลัพธ์: ถ้าสำเร็จ ให้เรียก complete_task
+        if success:
+            complete_task(task_id)
 
 def fetch_and_lock():
     """ดึงและล็อคงามจาก Operaton Engine"""
